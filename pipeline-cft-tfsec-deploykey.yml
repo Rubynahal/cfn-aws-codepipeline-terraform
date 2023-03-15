@@ -1,0 +1,340 @@
+---
+AWSTemplateFormatVersion: "2010-09-09"
+Description: CodePipeline for Terraform projects sourced from Github
+Parameters:
+  Environment:
+    Type: String
+    Description: Env Identifier/Terraform Workspace
+  TerraformDirPath:
+    Type: String
+    Description: The path to Terraform main file from repo root (i.e. tf/envs/prod/)
+  GithubOauthToken:
+    Type: String
+    Description: see http://docs.aws.amazon.com/codepipeline/latest/userguide/integrations-action-type.html for instructions
+  GithubOrgName:
+    Type: String
+    Description: Github Org
+  GithubRepoName:
+    Type: String
+    Description: GitHub repo containing terraform
+  GithubRepoBranch:
+    Type: String
+    Default: master
+    Description: Git branch to be sourced
+  TerraformVersion:
+    Type: String
+    Default: 0.12.16
+    Description: Terraform version
+  TerraformSha256:
+    Type: String
+    Default: fcc719314660adc66cbd688918d13baa1095301e2e507f9ac92c9e22acf4cc02
+    Description: SHA256 checksum for Terraform (source from dl page, default 0.11.14)
+  TerraformPlanCommands:
+    Type: String
+    Default: "terraform plan -no-color -input=false"
+    Description: Terraform plan command
+  TerraformApplyCommands:
+    Type: String
+    Default: "terraform apply -no-color -auto-approve"
+    Description: Terraform apply command
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: Environment
+        Parameters:
+          - Environment
+      - Label:
+          default: Source Code Repository
+        Parameters:
+          - GithubOrgName
+          - GithubRepoName
+          - GithubRepoBranch
+          - GithubOauthToken
+      - Label:
+          default: Terraform Installation Version
+        Parameters:
+          - TerraformVersion
+          - TerraformSha256
+      - Label:
+          default: Terraform main.tf path
+        Parameters:
+          - TerraformDirPath
+      - Label:
+          default: Terraform Commands
+        Parameters:
+          - TerraformPlanCommands
+          - TerraformApplyCommands
+Resources:
+  ArtifactStoreBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      VersioningConfiguration:
+        Status: Enabled
+      AccessControl: BucketOwnerFullControl
+  ApprovalTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      DisplayName: !Sub ${Environment}-ApprovalTopic
+      TopicName: !Sub ${Environment}-approval
+  Pipeline:
+    Type: AWS::CodePipeline::Pipeline
+    Properties:
+      RoleArn: !GetAtt PipelineRole.Arn
+      ArtifactStore:
+        Location: !Ref ArtifactStoreBucket
+        Type: S3
+      Stages:
+        - Name: Source
+          Actions:
+            - InputArtifacts: []
+              Name: Source
+              ActionTypeId:
+                Category: Source
+                Owner: ThirdParty
+                Version: 1
+                Provider: GitHub
+              OutputArtifacts:
+                - Name: SourceOutput
+              Configuration:
+                Owner: !Ref GithubOrgName
+                Repo: !Ref GithubRepoName
+                Branch: !Ref GithubRepoBranch
+                OAuthToken: !Ref GithubOauthToken
+              RunOrder: 1
+        - Name: TerraformPlan
+          Actions:
+          - Name: InvokeTerraformAction
+            ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Version: 1
+                Provider: CodeBuild
+            OutputArtifacts:
+              - Name: TerraformPlanOutput
+            InputArtifacts:
+              - Name: SourceOutput
+            Configuration:
+                ProjectName: !Ref InvokeTerraformPlan
+        - Name: TerraformApproval
+          Actions:
+          - Name: Approval
+            ActionTypeId:
+                Category: Approval
+                Owner: AWS
+                Version: 1
+                Provider: Manual
+            Configuration:
+              NotificationArn: !Ref ApprovalTopic
+              CustomData: Approve deployment
+            RunOrder: 2
+        - Name: TerraformApply
+          Actions:
+          - Name: InvokeTerraformAction
+            ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Version: 1
+                Provider: CodeBuild
+            OutputArtifacts:
+              - Name: TerraformApplyOutput
+            InputArtifacts:
+              - Name: TerraformPlanOutput
+            Configuration:
+                ProjectName: !Ref InvokeTerraformApply
+            RunOrder: 3
+  PipelineRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - codepipeline.amazonaws.com
+            Action: "sts:AssumeRole"
+      Path: /
+      Policies:
+        - PolicyName: AWS-CodePipeline-ServiceAcct
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "codecommit:CancelUploadArchive"
+                  - "codecommit:GetBranch"
+                  - "codecommit:GetCommit"
+                  - "codecommit:GetUploadArchiveStatus"
+                  - "codecommit:UploadArchive"
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - "codedeploy:CreateDeployment"
+                  - "codedeploy:GetApplicationRevision"
+                  - "codedeploy:GetDeployment"
+                  - "codedeploy:GetDeploymentConfig"
+                  - "codedeploy:RegisterApplicationRevision"
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - "codebuild:BatchGetBuilds"
+                  - "codebuild:StartBuild"
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - "lambda:InvokeFunction"
+                  - "lambda:ListFunctions"
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - "iam:PassRole"
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - "cloudwatch:*"
+                  - "s3:*"
+                  - "logs:*"
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - "sns:*"
+                Resource: !Ref ApprovalTopic
+  InvokeTerraformPlan:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/standard:2.0
+        Type: LINUX_CONTAINER
+      Name: !Sub ${AWS::StackName}-InvokeTerraformPlan
+      ServiceRole: !Ref InvokeTerraformRole
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: !Sub |
+          version: 0.2
+          env:
+            variables:
+              TF_DIR: !Sub ${TerraformDirPath}
+              Environment: !Sub ${Environment}
+            parameter-store:
+              ssh_key: "/deploy-codebuild/tf12-importable-modules.pem"
+              ssh_pub: "/deploy-codebuild/tf12-importable-modules.pub"
+          phases:
+            install:
+              runtime-versions:
+                golang: 1.12
+              commands:
+                - mkdir -p ~/.ssh
+                - echo "$ssh_key" > ~/.ssh/id_rsa
+                - echo "$ssh_pub" > ~/.ssh/id_rsa.pub
+                - chmod 600 ~/.ssh/id_rsa
+                - ssh-keygen -F github.com || ssh-keyscan github.com >>~/.ssh/known_hosts
+                - git config --global url."git@github.com:".insteadOf "https://github.com/"
+                - curl -s -qL -o /usr/bin/jq https://stedolan.github.io/jq/download/linux64/jq
+                - chmod +x /usr/bin/jq
+                - cd /tmp && curl -o terraform.zip https://releases.hashicorp.com/terraform/${TerraformVersion}/terraform_${TerraformVersion}_linux_amd64.zip && echo "${TerraformSha256} terraform.zip" | sha256sum -c --quiet && unzip terraform.zip && mv terraform /usr/bin
+                - wget -O /usr/bin/tfsec https://github.com/liamg/tfsec/releases/download/v0.19.0/tfsec-linux-amd64
+                - chmod +x /usr/bin/tfsec
+            build:
+              commands:
+                - cd $CODEBUILD_SRC_DIR/$TF_DIR
+                - terraform init -no-color -input=false
+                - terraform workspace select $Environment || (terraform workspace new $Environment && terraform workspace select $Environment)
+                - ${TerraformPlanCommands}
+                - tfsec --no-color
+            post_build:
+              commands:
+                - echo "terraform ${TerraformPlanCommands} completed on `date`"
+          artifacts:
+            files:
+              - '**/*'
+  InvokeTerraformApply:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/standard:2.0
+        Type: LINUX_CONTAINER
+      Name: !Sub ${AWS::StackName}-InvokeTerraformApply
+      ServiceRole: !Ref InvokeTerraformRole
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: !Sub |
+          version: 0.2
+          env:
+            variables:
+              TF_DIR: !Sub ${TerraformDirPath}
+              Environment: !Sub ${Environment}
+            parameter-store:
+              ssh_key: '/deploy-codebuild/tf12-importable-modules.pem'
+              ssh_pub: '/deploy-codebuild/tf12-importable-modules.pub'
+          phases:
+            install:
+              runtime-versions:
+                golang: 1.12
+              commands:
+                - mkdir -p ~/.ssh
+                - echo "$ssh_key" > ~/.ssh/id_rsa
+                - echo "$ssh_pub" > ~/.ssh/id_rsa.pub
+                - chmod 600 ~/.ssh/id_rsa
+                - ssh-keygen -F github.com || ssh-keyscan github.com >>~/.ssh/known_hosts
+                - git config --global url."git@github.com:".insteadOf "https://github.com/"
+                - curl -s -qL -o /usr/bin/jq https://stedolan.github.io/jq/download/linux64/jq
+                - chmod +x /usr/bin/jq
+                - cd /tmp && curl -o terraform.zip https://releases.hashicorp.com/terraform/${TerraformVersion}/terraform_${TerraformVersion}_linux_amd64.zip && echo "${TerraformSha256} terraform.zip" | sha256sum -c --quiet && unzip terraform.zip && mv terraform /usr/bin
+            build:
+              commands:
+                - cd $CODEBUILD_SRC_DIR/$TF_DIR
+                - terraform init -no-color -input=false
+                - terraform workspace select $Environment || (terraform workspace new $Environment && terraform workspace select $Environment)
+                - ${TerraformApplyCommands}
+  InvokeTerraformRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          Effect: Allow
+          Principal:
+            Service: codebuild.amazonaws.com
+          Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonS3FullAccess
+        - arn:aws:iam::aws:policy/AmazonDynamoDBFullAccess
+      Policies:
+        - PolicyName: "tfcodebuild"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "logs:*"
+                  - "ssm:GetParameters"
+                Resource: "*"
+        - PolicyName: "AssumeTFDeployRole"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "sts:AssumeRole"
+                  - "sts:GetFederationToken"
+                  - "sts:AssumeRoleWithSAML"
+                  - "sts:AssumeRoleWithWebIdentity"
+                Resource:
+                  - !Sub 'arn:aws:iam::${AWS::AccountId}:role/TerraformDeployRole'
+Outputs:
+  PipelineUrl:
+    Value: !Sub https://console.aws.amazon.com/codepipeline/home?region=${AWS::Region}#/view/${Pipeline}
+    Description: CodePipeline URL
+  ApprovalTopic:
+    Value: !Ref ApprovalTopic
+    Description: SNS ApprovalTopic ARN
+  InvokeTerraformRole:
+    Value: !Ref InvokeTerraformRole
+    Description: Terraform role ARN for cross account trust
